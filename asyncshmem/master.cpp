@@ -18,31 +18,17 @@ Path Shortest;
 LIST queue;
 
 
-inline void 
-announce_done()
-{
-        for (int i=1; i<NumProcs; i++)
-	   shmem_int_p(&isdone, 1, i);
-}
-
-inline void
-update_shortest()
-{
-        for( int i = 1 ; i<NumProcs ; i++)  
-	   shmem_int_swap(&newshortestlen,newshortestlen,i);
-}
-
-
 void 
 handler_master_subscribe(void *temp, size_t nbytes, int req_pe, shmemx_am_token_t token)
 {
-	// printf("about to subscribe %d\n",req_pe);
-	fflush(stdout);
 	shmemx_am_mutex_lock(&lock_workers_stack);
 	*(waiting+nwait) = req_pe;
 	nwait++;
-	// printf("Subscribing %d\n",req_pe);
+	//printf("AM: worker queue locked\n");
+	//fflush(stdout);
 	shmemx_am_mutex_unlock(&lock_workers_stack);
+	//printf("AM: Worker %d added to work queue\n",req_pe);
+	//fflush(stdout);
 }
 
 
@@ -52,15 +38,13 @@ handler_master_putpath(void *inbuf, size_t nbytes, int req_pe, shmemx_am_token_t
 	Msg_t* msg_buf = (Msg_t*)inbuf;
 	int pathcnt = nbytes/sizeof(Msg_t);
 
-	shmemx_am_mutex_lock(&lock_queue);
 	for(int i=0;i<pathcnt;i++) {
 	   Path* P = new Path();
 	   P->Set (msg_buf[i].length, msg_buf[i].city, msg_buf[i].visited);
+	   shmemx_am_mutex_lock(&lock_queue);
 	   queue.Insert(P, msg_buf[i].length);
+	   shmemx_am_mutex_unlock(&lock_queue);
 	}
-	//printf("Master received %d paths from %d\n",pathcnt,req_pe);
-	handler_master_subscribe(NULL, 0, req_pe, NULL);
-	shmemx_am_mutex_unlock(&lock_queue);
 }
 
 
@@ -69,6 +53,7 @@ handler_master_bestpath(void *msg_new, size_t nbytes, int req_pe, shmemx_am_toke
 {
 	static int bpath=0;
 	Msg_t* msg_buf = (Msg_t*)(msg_new);
+	shmemx_am_mutex_lock(&lock_shortestlen);
 	if (msg_buf->length < Shortest.length)
 	{
            bpath ++;
@@ -76,62 +61,68 @@ handler_master_bestpath(void *msg_new, size_t nbytes, int req_pe, shmemx_am_toke
                 bpath, req_pe, msg_buf->length);
            fflush(stdout);
            Shortest.Set (msg_buf->length, msg_buf->city, NumCities);
-	   shmem_int_swap(&newshortestlen,msg_buf->length,mype);
-	   shmem_int_swap(&isshortest,1,mype);
-	   shmem_quiet();
+	   newshortestlen = msg_buf->length;
+	   hclib::shmem_int_swap(&isshortest,1,mype); // communication with self is allowed within AM handler
         }
-	handler_master_subscribe(NULL, 0, req_pe, NULL);
+	shmemx_am_mutex_unlock(&lock_shortestlen);
 }	
+
+
+inline void 
+update_shortest()
+{
+        for( int i = 1 ; i<NumProcs ; i++ ) 
+           hclib::shmem_int_p(&newshortestlen, newshortestlen, i);
+}
+
+
+inline void 
+announce_done()
+{
+        for (int i=1; i<NumProcs; i++)
+	   hclib::shmem_int_p(&isdone, 1, i);
+}
 
 
 inline int 
 assign_task()
 {
-	int retval = 0, i=-1;
+	int retval = 0;
 	Path* P;
 	Msg_t* msg_buf = new Msg_t;
-	Msg_t* temp_msg_buf = (Msg_t*) malloc(NumCities*sizeof(Msg_t));
-	int* temp_dest_pe = (int*) malloc(NumCities*sizeof(int));
-
-        shmemx_am_mutex_lock(&lock_queue);	   // lock for queue
-	shmemx_am_mutex_lock(&lock_workers_stack); // lock for nwait
-        while(nwait>0) {
-	   if(!queue.IsEmpty()) {
-               // get a path and send it along with bestlength
-               P = (Path *)queue.Remove(NULL); 
-               msg_buf->length = P->length;
-               memcpy (msg_buf->city, P->city, MAXCITIES*sizeof(int));
-               msg_buf->visited = P->visited;
-               delete P;
-	       --nwait;
-	       ++i;
-	       memcpy((temp_msg_buf+i),msg_buf,sizeof(Msg_t));
-	       memcpy((temp_dest_pe+i),(waiting+nwait),sizeof(int));
-	   } else
-	       break;
-	}
-
-	if(nwait==NumProcs-1) {
-	       get_rtc_(&stop_time);
-               retval = 1;
-	}
-
-	shmemx_am_mutex_unlock(&lock_workers_stack);
-        shmemx_am_mutex_unlock(&lock_queue);
-
-	while(i>-1) {
-		// printf("Master sending worker %d = (%d,%d)\n",*(temp_dest_pe+i),
-		// 		(temp_msg_buf+i)->length,(temp_msg_buf+i)->visited);
-	         shmem_putmem(&msg_in, (temp_msg_buf+i), sizeof(Msg_t), *(temp_dest_pe+i));
-	         shmem_quiet();
-	         shmem_int_swap(&isnewpath,1,*(temp_dest_pe+i));
-		 i--;
-	}
-	shmem_quiet();
-
-	if(retval) {
-          announce_done();
-	}
+	shmemx_am_mutex_lock(&lock_workers_stack);
+	if(nwait>0) {
+           shmemx_am_mutex_unlock(&lock_workers_stack);
+           shmemx_am_mutex_lock(&lock_queue);
+           if(!queue.IsEmpty()) {
+              // get a path and send it along with bestlength
+              P = (Path *)queue.Remove(NULL); 
+              shmemx_am_mutex_unlock(&lock_queue);
+              msg_buf->length = P->length;
+              memcpy (msg_buf->city, P->city, MAXCITIES*sizeof(int));
+              msg_buf->visited = P->visited;
+              delete P;
+	      shmemx_am_mutex_lock(&lock_workers_stack);
+	      --nwait;
+	      int dest_pe = *(waiting+nwait);
+	      shmemx_am_mutex_unlock(&lock_workers_stack);
+	      hclib::shmem_putmem(&msg_in, msg_buf, sizeof(Msg_t), dest_pe);
+	      hclib::shmem_quiet();
+	      hclib::shmem_int_swap(&isnewpath,1,dest_pe);
+	      hclib::shmem_quiet();
+           } else {
+              shmemx_am_mutex_unlock(&lock_queue);
+	      shmemx_am_mutex_lock(&lock_workers_stack);
+	      if(nwait == NumProcs-1) {
+                shmemx_am_mutex_unlock(&lock_workers_stack);
+	        get_rtc_(&stop_time);
+                announce_done();
+                retval = 1;
+	      } else
+                shmemx_am_mutex_unlock(&lock_workers_stack);
+	   }
+	} else
+           shmemx_am_mutex_unlock(&lock_workers_stack);
 
 	return retval;
 }
@@ -148,19 +139,17 @@ void Master ()
   Shortest.length = INTMAX;   // The initial Shortest path must be bad
 
   get_rtc_res_(&res);
-  shmem_barrier_all();
+  hclib::shmem_barrier_all();
   printf("Coord started ...\n"); fflush(stdout);
-  shmem_barrier_all();
   get_rtc_(&start_time);
   while (1) 
   {
-    shmemx_am_poll();
+    if(hclib::shmem_int_swap(&isshortest,0,mype))  
+       update_shortest();
     if(assign_task())
        break;
-    if(shmem_int_swap(&isshortest,0,mype))
-	update_shortest();
   }
-  shmem_barrier_all();
+  hclib::shmem_barrier_all();
   printf("Shortest path:\n");
   Shortest.Print();
   double time = (stop_time - start_time)*1.0/double(res);
